@@ -1,0 +1,465 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Managing Long Lived Transactions with AWS Step Functions. AWS Step Functions is a fully managed 
+  Serverless workflow management service for managing long running processes and coordinating the 
+  components of distributed applications and microservices using visual workflows. This sample application 
+  demonstrates how you can deal with the complexities of distributed transactions and using AWS Step 
+  Functions implement the Saga design pattern.
+  
+Globals:
+  Function:
+    Tracing: Active
+    Handler: bootstrap
+    Runtime: provided.al2
+    MemorySize: 256
+    Timeout: 15
+    Tags:
+      source: aws
+      project: Managing Long Lived Transactions with AWS Step Functions
+
+Resources:
+  # NewOrderFunction represents task to create a new order and set status to "new order"
+  NewOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./order-new
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OrdersTable
+
+  NewOrderFunctionLogGroup:
+      Type: AWS::Logs::LogGroup
+      DependsOn: [ NewOrderFunction ]
+      Properties:
+        LogGroupName: !Sub /aws/lambda/${NewOrderFunction}
+        RetentionInDays: 7
+
+  # UpdateOrderFunction represents the compensating transaction to set order status to "pending"
+  UpdateOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./order-update
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OrdersTable
+
+  UpdateOrderFunctionLogGroup:
+      Type: AWS::Logs::LogGroup
+      DependsOn: [ UpdateOrderFunction ]
+      Properties:
+        LogGroupName: !Sub /aws/lambda/${UpdateOrderFunction}
+        RetentionInDays: 7
+
+  # DebitPaymentFunction
+  DebitPaymentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./payment-debit
+      Role: !Sub ${PaymentFunctionsRole.Arn}
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref PaymentsTable
+
+  DebitPaymentFunctionLogGroup:
+      Type: AWS::Logs::LogGroup
+      DependsOn: [ DebitPaymentFunction ]
+      Properties:
+        LogGroupName: !Sub /aws/lambda/${DebitPaymentFunction}
+        RetentionInDays: 7
+
+  # CreditPaymentFunction represents the compensating transaction to refund customer order
+  CreditPaymentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./payment-credit
+      Role: !Sub ${PaymentFunctionsRole.Arn}
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref PaymentsTable
+
+  CreditPaymentFunctionLogGroup:
+      Type: AWS::Logs::LogGroup
+      DependsOn: [ CreditPaymentFunction ]
+      Properties:
+        LogGroupName: !Sub /aws/lambda/${CreditPaymentFunction}
+        RetentionInDays: 7
+
+  # ReserveInventoryFunction represents task to reserve/remove order items from the inventory
+  ReserveInventoryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./inventory-reserve
+      Role: !Sub ${InventoryFunctionsRole.Arn}
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref InventoryTable
+
+  ReserveInventoryFunctionLogGroup:
+      Type: AWS::Logs::LogGroup
+      DependsOn: [ ReserveInventoryFunction ]
+      Properties:
+        LogGroupName: !Sub /aws/lambda/${ReserveInventoryFunction}
+        RetentionInDays: 7
+
+  # ReleaseInventoryFunction represents the compensating transaction to reverses the changes to the inventory
+  ReleaseInventoryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./inventory-release
+      Role: !Sub ${InventoryFunctionsRole.Arn}
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref InventoryTable
+
+  ReleaseInventoryFunctionLogGroup:
+      Type: AWS::Logs::LogGroup
+      DependsOn: [ ReleaseInventoryFunction ]
+      Properties:
+        LogGroupName: !Sub /aws/lambda/${ReleaseInventoryFunction}
+        RetentionInDays: 7
+
+
+  # TODO: Add your Step Function resource here
+  SagaStateMachine:
+    Type: "AWS::Serverless::StateMachine"
+    Properties:
+      DefinitionUri: statemachine/llt.asl.yaml
+      DefinitionSubstitutions:
+        NewOrderFunction: !GetAtt NewOrderFunction.Arn
+        UpdateOrderFunction: !GetAtt UpdateOrderFunction.Arn
+        ReserveInventoryFunction: !GetAtt ReserveInventoryFunction.Arn
+        ReleaseInventoryFunction: !GetAtt ReleaseInventoryFunction.Arn
+        DebitPaymentFunction: !GetAtt DebitPaymentFunction.Arn
+        CreditPaymentFunction: !GetAtt CreditPaymentFunction.Arn
+        SagaTopic: !Ref SagaTopic
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt SagaTopic.TopicName
+        - LambdaInvokePolicy:
+            FunctionName: !Ref NewOrderFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref UpdateOrderFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ReserveInventoryFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ReleaseInventoryFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DebitPaymentFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CreditPaymentFunction
+        - AWSXRayDaemonWriteAccess
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - "logs:CreateLogDelivery"
+                - "logs:GetLogDelivery"
+                - "logs:UpdateLogDelivery"
+                - "logs:DeleteLogDelivery"
+                - "logs:ListLogDeliveries"
+                - "logs:PutResourcePolicy"
+                - "logs:DescribeResourcePolicies"
+                - "logs:DescribeLogGroups"
+                - "cloudwatch:PutMetricData"
+              Resource: "*"
+      Logging:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachinesLogGroup.Arn
+        Level: ALL
+        IncludeExecutionData: True
+      Tracing:
+        Enabled: True
+      Tags:
+        source: aws
+        project: Managing Long Lived Transactions with AWS Step Functions
+
+  StateMachinesLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 3
+      LogGroupName: llt-statemachine-logs
+
+
+  #https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlesssimpletable
+  OrdersTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      PrimaryKey:
+        Name: order_id
+        Type: String
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      Tags:
+        project: reInvent2018
+        session: Managing Long Lived Transactions with AWS Step Functions
+
+  PaymentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "transaction_id"
+          AttributeType: "S"
+        - AttributeName: "order_id"
+          AttributeType: "S"
+        - AttributeName: "payment_type"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "transaction_id"
+          KeyType: "HASH"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      GlobalSecondaryIndexes:
+        - IndexName: "orderIDIndex"
+          KeySchema:
+            - AttributeName: "order_id"
+              KeyType: "HASH"
+            - AttributeName: "payment_type"
+              KeyType: "RANGE"
+          Projection:
+            ProjectionType: "ALL"
+          ProvisionedThroughput:
+            ReadCapacityUnits: 1
+            WriteCapacityUnits: 1
+      Tags:
+        - Key: source
+          Value: aws
+        - Key: project
+          Value: Managing Long Lived Transactions with AWS Step Functions
+
+  InventoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "transaction_id"
+          AttributeType: "S"
+        - AttributeName: "order_id"
+          AttributeType: "S"
+        - AttributeName: "transaction_type"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "transaction_id"
+          KeyType: "HASH"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      GlobalSecondaryIndexes:
+        - IndexName: "orderIDIndex"
+          KeySchema:
+            - AttributeName: "order_id"
+              KeyType: "HASH"
+            - AttributeName: "transaction_type"
+              KeyType: "RANGE"
+          Projection:
+            ProjectionType: "ALL"
+          ProvisionedThroughput:
+            ReadCapacityUnits: 1
+            WriteCapacityUnits: 1
+      Tags:
+        - Key: source
+          Value: aws
+        - Key: project
+          Value: Managing Long Lived Transactions with AWS Step Functions
+
+
+  SagaTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !GetAtt SagaQueue.Arn
+          Protocol: sqs
+      Tags:
+        - Key: source
+          Value: aws
+        - Key: project
+          Value: Managing Long Lived Transactions with AWS Step Functions
+
+
+  SagaQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      RedrivePolicy: 
+        deadLetterTargetArn: !GetAtt SagaDeadLetterQueue.Arn
+        maxReceiveCount: 5
+      Tags:
+        - Key: source
+          Value: aws
+        - Key: project
+          Value: Managing Long Lived Transactions with AWS Step Functions
+
+  SagaDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      Tags:
+        - Key: source
+          Value: aws
+        - Key: project
+          Value: Managing Long Lived Transactions with AWS Step Functions
+
+  SagaQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Allow-SendMessage
+            Effect: Allow
+            Principal:
+              AWS: "*"
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt SagaQueue.Arn
+            Condition:
+              ArnEquals:
+                "aws:SourceArn": !Ref SagaTopic
+      Queues:
+        - !Ref SagaQueue
+
+
+  InventoryFunctionsRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess"
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "AllowLambdaServiceToAssumeRole"
+            Effect: "Allow"
+            Action:
+              - "sts:AssumeRole"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+      Policies:
+        - PolicyName: "AllowCRUDOperationsOnDynamoDB"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "dynamodb:GetItem"
+                  - "dynamodb:DeleteItem"
+                  - "dynamodb:DescribeTable"
+                  - "dynamodb:PutItem"
+                  - "dynamodb:Scan"
+                  - "dynamodb:Query"
+                  - "dynamodb:UpdateItem"
+                  - "dynamodb:BatchWriteItem"
+                  - "dynamodb:BatchGetItem"
+                Resource:
+                  - !Sub ${InventoryTable.Arn}
+                  - !Sub ${InventoryTable.Arn}/index/*
+
+  PaymentFunctionsRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess"
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "AllowLambdaServiceToAssumeRole"
+            Effect: "Allow"
+            Action:
+              - "sts:AssumeRole"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+      Policies:
+        - PolicyName: "AllowCRUDOperationsOnDynamoDB"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "dynamodb:GetItem"
+                  - "dynamodb:DeleteItem"
+                  - "dynamodb:DescribeTable"
+                  - "dynamodb:PutItem"
+                  - "dynamodb:Scan"
+                  - "dynamodb:Query"
+                  - "dynamodb:UpdateItem"
+                  - "dynamodb:BatchWriteItem"
+                  - "dynamodb:BatchGetItem"
+                Resource:
+                  - !Sub ${PaymentsTable.Arn}
+                  - !Sub ${PaymentsTable.Arn}/index/*
+
+
+Outputs:
+
+  # NewOrderFunction
+  NewOrderFunctionArn:
+    Description: "Process Order Function ARN"
+    Value: !GetAtt NewOrderFunction.Arn
+
+  NewOrderFunctionIamRole:
+    Description: "Implicit IAM Role created for Process Order function"
+    Value: !GetAtt NewOrderFunctionRole.Arn
+
+  # UpdateOrderFunction
+  UpdateOrderFunction:
+    Description: "Process Order Update Function ARN"
+    Value: !GetAtt UpdateOrderFunction.Arn
+
+  UpdateOrderFunctionIamRole:
+    Description: "Implicit IAM Role created for Process Order function"
+    Value: !GetAtt UpdateOrderFunctionRole.Arn
+
+  # DebitPaymentFunction
+  DebitPaymentFunctionArn:
+    Description: "Process Payment Function ARN"
+    Value: !GetAtt DebitPaymentFunction.Arn
+
+  # CreditPaymentFunction
+  CreditPaymentFunctionArn:
+    Description: "Process Payment Refund Function ARN"
+    Value: !GetAtt CreditPaymentFunction.Arn
+
+  PaymentFunctionsIamRole:
+    Description: "Implicit IAM Role created for payment functions"
+    Value: !GetAtt PaymentFunctionsRole.Arn
+
+  # ReserveInventoryFunction
+  ReserveInventoryFunctionArn:
+    Description: "Reserve Inventory Function ARN"
+    Value: !GetAtt ReserveInventoryFunction.Arn
+
+  # ReleaseInventoryFunction
+  ReleaseInventoryFunctionFunctionArn:
+    Description: "Release Inventory Function ARN"
+    Value: !GetAtt ReleaseInventoryFunction.Arn
+
+  InventoryFunctionsIamRole:
+    Description: "Implicit IAM Role created for inventory functions"
+    Value: !GetAtt InventoryFunctionsRole.Arn
+
+  # Step Function ARN
+  SagaStateMachineArn:
+    Description: Step Functions State Machine ARN
+    Value: !Ref SagaStateMachine
+
+  # DynamoDB Table ARN's
+  OrdersTableArn:
+    Description: "Orders table ARN"
+    Value: !GetAtt OrdersTable.Arn
+
+  PaymentsTableArn:
+    Description: "Payments table ARN"
+    Value: !GetAtt PaymentsTable.Arn
+
+  InventoryTableArn:
+    Description: "Inventory table ARN"
+    Value: !GetAtt InventoryTable.Arn
